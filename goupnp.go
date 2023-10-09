@@ -122,6 +122,33 @@ func DiscoverDevices(searchTarget string) ([]MaybeRootDevice, error) {
 	return DiscoverDevicesCtx(context.Background(), searchTarget)
 }
 
+// DiscoverDevicesContinuousCtx reik 持续搜索
+func DiscoverDevicesContinuousCtx(ctx context.Context, searchTarget string) chan MaybeRootDevice {
+	result := make(chan MaybeRootDevice)
+	go func() {
+		devicesChan := make(chan []MaybeRootDevice)
+	loop:
+		for {
+			go func() {
+				devices, _ := DiscoverDevicesCtx(ctx, searchTarget)
+				//这里可能要考虑发送设备数组,不然需要另外一个chan来通知设备输出完成
+				devicesChan <- devices
+			}()
+			select {
+			case <-ctx.Done():
+				fmt.Println("close result")
+				close(result)
+				break loop
+			case devices := <-devicesChan:
+				for _, newDevice := range devices {
+					result <- newDevice
+				}
+			}
+		}
+	}()
+	return result
+}
+
 func DeviceByURLCtx(ctx context.Context, loc *url.URL) (*RootDevice, error) {
 	locStr := loc.String()
 	root := new(RootDevice)
