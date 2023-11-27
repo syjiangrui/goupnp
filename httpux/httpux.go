@@ -1,11 +1,11 @@
-package httpu
+package httpux
 
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"log"
 	"net"
 	"net/http"
@@ -22,13 +22,12 @@ type ClientInterface interface {
 	// responses.
 	Do(
 		req *http.Request,
-		timeout time.Duration,
-		numSends int,
-	) ([]*http.Response, error)
+		interval time.Duration,
+	) error
+
+	ReceiveChan() chan *http.Response
 }
 
-// ClientInterfaceCtx is the equivalent of ClientInterface, except with methods
-// taking a context.Context parameter.
 type ClientInterfaceCtx interface {
 	// DoWithContext performs a request. If the input request has a
 	// deadline, then that value will be used as the timeout for how long
@@ -44,8 +43,10 @@ type ClientInterfaceCtx interface {
 	// in receipt simply do not add to the resulting responses.
 	DoWithContext(
 		req *http.Request,
-		numSends int,
-	) ([]*http.Response, error)
+		interval time.Duration,
+	) error
+
+	ReceiveChan() chan *http.Response
 }
 
 // HTTPUClient is a client for dealing with HTTPU (HTTP over UDP). Its typical
@@ -53,10 +54,8 @@ type ClientInterfaceCtx interface {
 type HTTPUClient struct {
 	connLock sync.Mutex // Protects use of conn.
 	conn     net.PacketConn
+	receiver chan *http.Response
 }
-
-var _ ClientInterface = &HTTPUClient{}
-var _ ClientInterfaceCtx = &HTTPUClient{}
 
 // NewHTTPUClient creates a new HTTPUClient, opening up a new UDP socket for the
 // purpose.
@@ -65,7 +64,7 @@ func NewHTTPUClient() (*HTTPUClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &HTTPUClient{conn: conn}, nil
+	return &HTTPUClient{conn: conn, receiver: make(chan *http.Response)}, nil
 }
 
 // NewHTTPUClientAddr creates a new HTTPUClient which will broadcast packets
@@ -87,6 +86,7 @@ func NewHTTPUClientAddr(addr string) (*HTTPUClient, error) {
 func (httpu *HTTPUClient) Close() error {
 	httpu.connLock.Lock()
 	defer httpu.connLock.Unlock()
+	close(httpu.receiver)
 	return httpu.conn.Close()
 }
 
@@ -96,18 +96,9 @@ func (httpu *HTTPUClient) Close() error {
 // HTTPUClient.
 func (httpu *HTTPUClient) Do(
 	req *http.Request,
-	timeout time.Duration,
-	numSends int,
-) ([]*http.Response, error) {
-	ctx := req.Context()
-	if timeout > 0 {
-		var cancel func()
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-		req = req.WithContext(ctx)
-	}
-
-	return httpu.DoWithContext(req, numSends)
+	interval time.Duration,
+) error {
+	return httpu.DoWithContext(req, interval)
 }
 
 // DoWithContext implements ClientInterfaceCtx.DoWithContext.
@@ -116,11 +107,38 @@ func (httpu *HTTPUClient) Do(
 // regarding cancellation!
 func (httpu *HTTPUClient) DoWithContext(
 	req *http.Request,
-	numSends int,
-) ([]*http.Response, error) {
-	httpu.connLock.Lock()
-	defer httpu.connLock.Unlock()
+	interval time.Duration,
+) error {
+	tasks := &errgroup.Group{}
+	tasks.Go(func() error {
+		return httpu.startLoopSendHTTPURequest(req, interval)
+	})
 
+	tasks.Go(func() error {
+		return httpu.startReceiveResponse(req)
+	})
+	return tasks.Wait()
+}
+
+func (httpu *HTTPUClient) startLoopSendHTTPURequest(req *http.Request, interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	ctx := req.Context()
+	for {
+		select {
+		case <-ticker.C:
+			err := httpu.sendHTTPURequest(req)
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+	}
+	return nil
+}
+
+func (httpu *HTTPUClient) sendHTTPURequest(req *http.Request) error {
 	// Create the request. This is a subset of what http.Request.Write does
 	// deliberately to avoid creating extra fields which may confuse some
 	// devices.
@@ -130,29 +148,21 @@ func (httpu *HTTPUClient) DoWithContext(
 		method = "GET"
 	}
 	if _, err := fmt.Fprintf(&requestBuf, "%s %s HTTP/1.1\r\n", method, req.URL.RequestURI()); err != nil {
-		return nil, err
+		return err
 	}
 	if err := req.Header.Write(&requestBuf); err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := requestBuf.Write([]byte{'\r', '\n'}); err != nil {
-		return nil, err
+		return err
 	}
 
 	destAddr, err := net.ResolveUDPAddr("udp", req.Host)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	// Handle context deadline/timeout
 	ctx := req.Context()
-	deadline, ok := ctx.Deadline()
-	if ok {
-		if err = httpu.conn.SetDeadline(deadline); err != nil {
-			return nil, err
-		}
-	}
-
 	// Handle context cancelation
 	done := make(chan struct{})
 	defer close(done)
@@ -166,18 +176,16 @@ func (httpu *HTTPUClient) DoWithContext(
 	}()
 
 	// Send request.
-	for i := 0; i < numSends; i++ {
-		if n, err := httpu.conn.WriteTo(requestBuf.Bytes(), destAddr); err != nil {
-			return nil, err
-		} else if n < len(requestBuf.Bytes()) {
-			return nil, fmt.Errorf("httpu: wrote %d bytes rather than full %d in request",
-				n, len(requestBuf.Bytes()))
-		}
-		time.Sleep(5 * time.Millisecond)
+	if n, err := httpu.conn.WriteTo(requestBuf.Bytes(), destAddr); err != nil {
+		return err
+	} else if n < len(requestBuf.Bytes()) {
+		return fmt.Errorf("httpu: wrote %d bytes rather than full %d in request",
+			n, len(requestBuf.Bytes()))
 	}
+	return nil
+}
 
-	// Await responses until timeout.
-	var responses []*http.Response
+func (httpu *HTTPUClient) startReceiveResponse(req *http.Request) error {
 	responseBytes := make([]byte, 2048)
 	for {
 		// 2048 bytes should be sufficient for most networks.
@@ -193,7 +201,7 @@ func (httpu *HTTPUClient) DoWithContext(
 					continue
 				}
 			}
-			return nil, err
+			return err
 		}
 
 		// Parse response.
@@ -209,12 +217,8 @@ func (httpu *HTTPUClient) DoWithContext(
 		if a, ok := httpu.conn.LocalAddr().(*net.UDPAddr); ok {
 			response.Header.Add(LocalAddressHeader, a.IP.String())
 		}
-
-		responses = append(responses, response)
 	}
-
-	// Timeout reached - return discovered responses.
-	return responses, nil
+	return nil
 }
 
 const LocalAddressHeader = "goupnp-local-address"

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"strconv"
 )
 
 const (
@@ -44,13 +45,19 @@ func (client *SOAPClient) PerformActionCtx(ctx context.Context, actionNamespace,
 		Method: "POST",
 		URL:    &client.EndpointURL,
 		Header: http.Header{
-			"SOAPACTION":   []string{`"` + actionNamespace + "#" + actionName + `"`},
+			"SOAPAction":   []string{`"` + actionNamespace + "#" + actionName + `"`},
 			"CONTENT-TYPE": []string{"text/xml; charset=\"utf-8\""},
 		},
 		Body: ioutil.NopCloser(bytes.NewBuffer(requestBytes)),
 		// Set ContentLength to avoid chunked encoding - some servers might not support it.
 		ContentLength: int64(len(requestBytes)),
 	}
+	// no cache
+	req.Header.Set("CACHE-CONTROL", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+
 	req = req.WithContext(ctx)
 	response, err := client.HTTPClient.Do(req)
 	if err != nil {
@@ -135,6 +142,10 @@ func encodeRequestArgs(w *bytes.Buffer, inAction interface{}) error {
 			argName = nameOverride
 		}
 		value := in.Field(i)
+		// if value is uint32 convert to string
+		if value.Kind() == reflect.Uint32 {
+			value = reflect.ValueOf(strconv.FormatUint(value.Uint(), 10))
+		}
 		if value.Kind() != reflect.String {
 			return fmt.Errorf("goupnp: SOAP arg %q is not of type string, but of type %v", argName, value.Type())
 		}

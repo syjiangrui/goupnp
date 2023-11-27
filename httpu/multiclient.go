@@ -1,6 +1,7 @@
 package httpu
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -105,6 +106,9 @@ func (mc *MultiClientCtx) DoWithContext(
 		for rs := range results {
 			responses = append(responses, rs...)
 		}
+		if len(responses) > 0 {
+			fmt.Println("responses vaild")
+		}
 		return nil
 	})
 
@@ -122,7 +126,7 @@ func (mc *MultiClientCtx) sendRequestsCtx(
 		tasks.Go(func() error {
 			responses, err := d.DoWithContext(req, numSends)
 			if err != nil {
-				return err
+				//return err
 			}
 			results <- responses
 			return nil
