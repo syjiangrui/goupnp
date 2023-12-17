@@ -24,12 +24,19 @@ const (
 type SOAPClient struct {
 	EndpointURL url.URL
 	HTTPClient  http.Client
+	UserAgent   string
 }
 
-func NewSOAPClient(endpointURL url.URL) *SOAPClient {
+func NewSOAPClient(endpointURL url.URL, userAgent string) *SOAPClient {
 	return &SOAPClient{
 		EndpointURL: endpointURL,
+		UserAgent:   userAgent,
 	}
+}
+
+// SetUserAgent sets the User-Agent header used for SOAP requests.
+func (client *SOAPClient) SetUserAgent(userAgent string) {
+	client.UserAgent = userAgent
 }
 
 // PerformSOAPAction makes a SOAP request, with the given action.
@@ -47,6 +54,7 @@ func (client *SOAPClient) PerformActionCtx(ctx context.Context, actionNamespace,
 		Header: http.Header{
 			"SOAPAction":   []string{`"` + actionNamespace + "#" + actionName + `"`},
 			"CONTENT-TYPE": []string{"text/xml; charset=\"utf-8\""},
+			"USER-AGENT":   []string{client.UserAgent},
 		},
 		Body: ioutil.NopCloser(bytes.NewBuffer(requestBytes)),
 		// Set ContentLength to avoid chunked encoding - some servers might not support it.
@@ -54,7 +62,6 @@ func (client *SOAPClient) PerformActionCtx(ctx context.Context, actionNamespace,
 	}
 	// no cache
 	req.Header.Set("CACHE-CONTROL", "no-cache")
-	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip, deflate")
 
